@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>真・結界師VR — Enemy Update v7.1</title>
+<title>真・結界師VR — Auto Aim v7.4</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#87CEEB">
 <style>
@@ -102,7 +102,7 @@ import * as CANNON from 'cannon-es';
 // 1. CONFIG
 // --------------------------------------------------
 const CFG = {
-  VERSION: "v7.1",
+  VERSION: "v7.4",
   colors: {
     sky: 0x87CEEB, ground: 0xC2B280, 
     kekkai: 0xffff00, ghost: 0x00ffff, 
@@ -112,12 +112,12 @@ const CFG = {
     wall: 0xa0a0a0, building: 0xf0f0f0, pool: 0x88cccc,
     enemy: 0xff4444, giant: 0x880000, target: 0xFFD700, item: 0x00ff00, vip: 0x0000ff,
     wood: 0x8B4513, leaf: 0x228B22, iron: 0x333333, concrete: 0xaaaaaa,
-    // 新敵タイプの色
     floater_high: 0xffffee, floater_low: 0xff8800, jumper: 0x00ff88
   },
   player: { speed: 10.0, jump: 22.0, height: 1.7, maxHp: 100, maxSp: 100 },
   kekkai: { sensitivity: 300.0, spCostPerSec: 1.0, spRegen: 5.0, metsuCost: 1.0 },
   dist: { near: 6.0, far: 20.0 },
+  aimAssist: { radius: 1.5, angle: 0.5 }, // 1.5m radius or ~30deg
   field: { width: 120, depth: 160 }
 };
 
@@ -137,7 +137,6 @@ let currentDist = CFG.dist.near, aimMarker, isPhysMode = false;
 let controllers = [], controllerGrips = [], vrHudMesh, vrHudCtx, vipGoalMesh = null;
 let currentSession = null, lastT = 0;
 
-const raycaster = new THREE.Raycaster();
 let currentTargetKekkai = null; 
 
 const _vecDir = new THREE.Vector3();
@@ -364,7 +363,6 @@ function spawnEnemy(forceType=null) {
   } else if (Math.random() < 0.1) {
     spawnGiant(x, y, z); 
   } else { 
-    // 新しい敵タイプの抽選
     const typeR = Math.random();
     let type = 'normal';
     let sz = 0.6 + Math.random() * 0.8;
@@ -374,8 +372,8 @@ function spawnEnemy(forceType=null) {
     if (typeR < 0.2) {
         type = 'floater_high';
         col = new THREE.Color(CFG.colors.floater_high);
-        y = 15; // 高空スポーン
-        ms = 5; // 軽い
+        y = 15; 
+        ms = 5; 
     } else if (typeR < 0.4) {
         type = 'floater_low';
         col = new THREE.Color(CFG.colors.floater_low);
@@ -385,13 +383,12 @@ function spawnEnemy(forceType=null) {
         type = 'jumper';
         col = new THREE.Color(CFG.colors.jumper);
         y = 5;
-        ms = 20; // 少し重い
+        ms = 20; 
     }
 
     const b = new CANNON.Body({ mass: ms, shape: new CANNON.Sphere(sz), material: new CANNON.Material('ene'), linearDamping: 0.4, collisionFilterGroup: 4, collisionFilterMask: 1|2|4 }); 
     b.position.set(x, y, z); world.addBody(b); b.outsideTimer = 0; 
     
-    // 見た目の変化（簡易）
     let geo;
     if(type === 'floater_high') geo = new THREE.OctahedronGeometry(sz, 0);
     else if(type === 'floater_low') geo = new THREE.ConeGeometry(sz, sz*2, 8);
@@ -399,7 +396,6 @@ function spawnEnemy(forceType=null) {
     else geo = new THREE.IcosahedronGeometry(sz, 0);
 
     const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: col, roughness: 0.3 })); 
-    // Coneの場合回転
     if(type === 'floater_low') m.rotation.x = Math.PI/2; 
 
     scene.add(m); 
@@ -502,36 +498,70 @@ function actionGlobalKai() {
 function updateAimMarker() { 
   if(!playerGroup || !aimMarker) return; 
    
-  if (renderer.xr.isPresenting) { 
-    camera.getWorldPosition(_vecPos);
-    camera.getWorldDirection(_vecDir);
-    aimMarker.position.copy(_vecPos).add(_vecDir.multiplyScalar(currentDist));
-    aimMarker.rotation.y = Math.atan2(_vecDir.x, _vecDir.z);
-    aimMarker.visible = true; 
-    
-    raycaster.set(_vecPos, _vecDir);
-    const intersects = raycaster.intersectObjects(kekkaiList.map(k => k.mesh));
-    if (currentTargetKekkai && (!intersects.length || intersects[0].object !== currentTargetKekkai.mesh)) {
-       currentTargetKekkai.edges.material.color.setHex(0xffffff); 
-       currentTargetKekkai.edges.material.linewidth = 1;
-       currentTargetKekkai = null;
-    }
-    if (intersects.length > 0) {
-      const hitMesh = intersects[0].object;
-      const target = kekkaiList.find(k => k.mesh === hitMesh);
-      if (target && target !== currentTargetKekkai) {
-        currentTargetKekkai = target;
-        currentTargetKekkai.edges.material.color.setHex(CFG.colors.highlight); 
-        currentTargetKekkai.edges.material.linewidth = 3;
+  // Force update camera world matrix for reliable raycasting on mobile/VR
+  camera.updateMatrixWorld(true);
+
+  camera.getWorldPosition(_vecPos);
+  camera.getWorldDirection(_vecDir);
+  
+  // Aim marker position
+  aimMarker.position.copy(_vecPos).add(_vecDir.clone().multiplyScalar(currentDist));
+  aimMarker.rotation.y = Math.atan2(_vecDir.x, _vecDir.z);
+  aimMarker.visible = true; 
+  
+  // Smart Targeting: Thick Raycast (Cone/Cylinder)
+  // Find the barrier that is:
+  // 1. In front of the player (dot product > 0)
+  // 2. Closest to the center of vision (smallest distance from ray)
+  // 3. Within max distance
+  
+  let bestCandidate = null;
+  let minDistanceToRay = CFG.aimAssist.radius; // e.g. 1.5m radius from reticle line
+  
+  kekkaiList.forEach(k => {
+      if(k.shrinking) return;
+      
+      const kPos = k.mesh.position;
+      const vecToK = kPos.clone().sub(_vecPos);
+      
+      // Project barrier position onto camera direction ray
+      // t = projection length
+      const t = vecToK.dot(_vecDir);
+      
+      // Must be in front and within range
+      if (t > 0 && t < CFG.dist.far + 5) {
+          // Calculate closest point on the ray
+          const closestPointOnRay = _vecPos.clone().add(_vecDir.clone().multiplyScalar(t));
+          // Distance from barrier center to ray
+          const distToRay = kPos.distanceTo(closestPointOnRay);
+          
+          if (distToRay < minDistanceToRay) {
+              // Found a better candidate (closer to center of screen)
+              // We could also factor in distance from player (t) to prioritize closer objects, 
+              // but purely aiming-based is usually more intuitive. 
+              // Let's prefer closer objects if aim is similar? 
+              // Simple: just pick closest to ray.
+              minDistanceToRay = distToRay;
+              bestCandidate = k;
+          }
       }
-    }
-  } else { 
-    aimMarker.visible = true; 
-    const e = new THREE.Euler(camAngle.pitch, camAngle.yaw, 0, 'YXZ'); 
-    const d = new THREE.Vector3(0, 0, -1).applyEuler(e); 
-    const p = playerGroup.position.clone().add(d.multiplyScalar(currentDist)); 
-    p.y = Math.max(0.5, p.y); aimMarker.position.copy(p); 
-  } 
+  });
+
+  if (currentTargetKekkai && currentTargetKekkai !== bestCandidate) {
+     if(currentTargetKekkai.edges && currentTargetKekkai.edges.material) {
+         currentTargetKekkai.edges.material.color.setHex(0xffffff);
+         currentTargetKekkai.edges.material.linewidth = 1;
+     }
+  }
+  
+  currentTargetKekkai = bestCandidate;
+  
+  if (currentTargetKekkai) {
+      if(currentTargetKekkai.edges && currentTargetKekkai.edges.material) {
+          currentTargetKekkai.edges.material.color.setHex(CFG.colors.highlight);
+          currentTargetKekkai.edges.material.linewidth = 3;
+      }
+  }
 }
 
 function startVipMission() { 
@@ -587,6 +617,9 @@ function handleVRInput() {
   if (!session) return;
 
   const cam = renderer.xr.getCamera();
+  // Ensure camera matrix is updated for controller relative movement
+  cam.updateMatrixWorld(true);
+  
   camera.getWorldDirection(_vecDir);
   _vecDir.y = 0; _vecDir.normalize(); 
   _vecRight.crossVectors(_vecDir, _vecUp).normalize(); 
@@ -840,33 +873,26 @@ function loop(t) {
         const target = (vip && vip.hp > 0) ? vip.body.position : playerBody.position; 
         const d = target.vsub(e.body.position); d.normalize(); 
         
-        // --- 敵タイプ別行動ロジック ---
         if (e.type === 'floater_high') {
-           // 高空維持 (ふわふわ)
            const hoverH = 12.0 + Math.sin(t * 0.002 + e.body.id) * 2;
-           // 重力相殺 + 高さ調整
-           e.body.force.y += 30 * e.body.mass; // Gravity cancel
+           e.body.force.y += 30 * e.body.mass; 
            const hDiff = hoverH - e.body.position.y;
-           e.body.applyForce(new CANNON.Vec3(d.x * 5, hDiff * 5, d.z * 5), e.body.position); // ゆっくり追従
+           e.body.applyForce(new CANNON.Vec3(d.x * 5, hDiff * 5, d.z * 5), e.body.position); 
         } 
         else if (e.type === 'floater_low') {
-           // 低空維持 (アグレッシブ)
            const hoverH = 3.0 + Math.cos(t * 0.005 + e.body.id);
            e.body.force.y += 30 * e.body.mass;
            const hDiff = hoverH - e.body.position.y;
-           e.body.applyForce(new CANNON.Vec3(d.x * 30, hDiff * 10, d.z * 30), e.body.position); // 速く追従
+           e.body.applyForce(new CANNON.Vec3(d.x * 30, hDiff * 10, d.z * 30), e.body.position); 
         } 
         else if (e.type === 'jumper') {
-           // バウンド移動
-           // 接地判定 (簡易)
            if (e.body.position.y < 1.0 && e.body.velocity.y < 0.1) {
-               e.body.velocity.y = 15; // Jump
+               e.body.velocity.y = 15; 
                e.body.velocity.x = d.x * 10;
                e.body.velocity.z = d.z * 10;
            }
         } 
         else {
-           // 通常 & Giant
            e.body.applyForce(d.scale(e.isGiant ? 100 : 20), e.body.position); 
         }
 
