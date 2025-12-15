@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>真・結界師VR — Auto Aim v7.4</title>
+<title>真・結界師VR — Final Adjust v7.6</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#87CEEB">
 <style>
@@ -102,7 +102,7 @@ import * as CANNON from 'cannon-es';
 // 1. CONFIG
 // --------------------------------------------------
 const CFG = {
-  VERSION: "v7.4",
+  VERSION: "v7.6",
   colors: {
     sky: 0x87CEEB, ground: 0xC2B280, 
     kekkai: 0xffff00, ghost: 0x00ffff, 
@@ -117,7 +117,8 @@ const CFG = {
   player: { speed: 10.0, jump: 22.0, height: 1.7, maxHp: 100, maxSp: 100 },
   kekkai: { sensitivity: 300.0, spCostPerSec: 1.0, spRegen: 5.0, metsuCost: 1.0 },
   dist: { near: 6.0, far: 20.0 },
-  aimAssist: { radius: 1.5, angle: 0.5 }, // 1.5m radius or ~30deg
+  // 修正：基本アシスト半径1.5mだが、結界サイズに応じて拡大する
+  aimAssist: { baseRadius: 1.5 }, 
   field: { width: 120, depth: 160 }
 };
 
@@ -139,6 +140,7 @@ let currentSession = null, lastT = 0;
 
 let currentTargetKekkai = null; 
 
+const raycaster = new THREE.Raycaster();
 const _vecDir = new THREE.Vector3();
 const _vecPos = new THREE.Vector3();
 const _vecRight = new THREE.Vector3();
@@ -498,54 +500,55 @@ function actionGlobalKai() {
 function updateAimMarker() { 
   if(!playerGroup || !aimMarker) return; 
    
-  // Force update camera world matrix for reliable raycasting on mobile/VR
   camera.updateMatrixWorld(true);
-
   camera.getWorldPosition(_vecPos);
   camera.getWorldDirection(_vecDir);
-  
-  // Aim marker position
   aimMarker.position.copy(_vecPos).add(_vecDir.clone().multiplyScalar(currentDist));
   aimMarker.rotation.y = Math.atan2(_vecDir.x, _vecDir.z);
   aimMarker.visible = true; 
   
-  // Smart Targeting: Thick Raycast (Cone/Cylinder)
-  // Find the barrier that is:
-  // 1. In front of the player (dot product > 0)
-  // 2. Closest to the center of vision (smallest distance from ray)
-  // 3. Within max distance
-  
   let bestCandidate = null;
-  let minDistanceToRay = CFG.aimAssist.radius; // e.g. 1.5m radius from reticle line
   
-  kekkaiList.forEach(k => {
-      if(k.shrinking) return;
-      
-      const kPos = k.mesh.position;
-      const vecToK = kPos.clone().sub(_vecPos);
-      
-      // Project barrier position onto camera direction ray
-      // t = projection length
-      const t = vecToK.dot(_vecDir);
-      
-      // Must be in front and within range
-      if (t > 0 && t < CFG.dist.far + 5) {
-          // Calculate closest point on the ray
-          const closestPointOnRay = _vecPos.clone().add(_vecDir.clone().multiplyScalar(t));
-          // Distance from barrier center to ray
-          const distToRay = kPos.distanceTo(closestPointOnRay);
+  // 修正: 結界のサイズを考慮した判定ロジック
+  // 中心からの距離だけでなく、結界のバウンディングボックスの大きさを加味して
+  // 「視線がその近くを通っているか」を判定する。
+  
+  // 1. Raycast (Precise Hit)
+  raycaster.set(_vecPos, _vecDir);
+  const intersects = raycaster.intersectObjects(kekkaiList.map(k => k.mesh));
+  if (intersects.length > 0) {
+      bestCandidate = kekkaiList.find(k => k.mesh === intersects[0].object);
+  }
+
+  // 2. Fuzzy Assist (Size-dependent)
+  if (!bestCandidate) {
+      let minDistanceToRay = 999;
+      kekkaiList.forEach(k => {
+          if(k.shrinking) return;
+          const kPos = k.mesh.position;
+          const vecToK = kPos.clone().sub(_vecPos);
+          const t = vecToK.dot(_vecDir);
           
-          if (distToRay < minDistanceToRay) {
-              // Found a better candidate (closer to center of screen)
-              // We could also factor in distance from player (t) to prioritize closer objects, 
-              // but purely aiming-based is usually more intuitive. 
-              // Let's prefer closer objects if aim is similar? 
-              // Simple: just pick closest to ray.
-              minDistanceToRay = distToRay;
-              bestCandidate = k;
+          if (t > 0 && t < CFG.dist.far + 20) {
+              const closestPoint = _vecPos.clone().add(_vecDir.clone().multiplyScalar(t));
+              const dist = kPos.distanceTo(closestPoint);
+              
+              // 結界のサイズ（最大辺）を取得
+              const size = Math.max(k.mesh.scale.x, k.mesh.scale.y, k.mesh.scale.z);
+              // アシスト許容範囲 = 基本1.5m + サイズの半分 (大きいほど吸い付きやすい)
+              const allowDist = CFG.aimAssist.baseRadius + (size * 0.5);
+              
+              if (dist < allowDist) {
+                  // Rayからの距離が許容範囲内なら候補にする
+                  // 複数の場合は「Rayからの絶対距離が最も近いもの」を選ぶ
+                  if (dist < minDistanceToRay) {
+                      minDistanceToRay = dist;
+                      bestCandidate = k;
+                  }
+              }
           }
-      }
-  });
+      });
+  }
 
   if (currentTargetKekkai && currentTargetKekkai !== bestCandidate) {
      if(currentTargetKekkai.edges && currentTargetKekkai.edges.material) {
@@ -555,7 +558,6 @@ function updateAimMarker() {
   }
   
   currentTargetKekkai = bestCandidate;
-  
   if (currentTargetKekkai) {
       if(currentTargetKekkai.edges && currentTargetKekkai.edges.material) {
           currentTargetKekkai.edges.material.color.setHex(CFG.colors.highlight);
@@ -617,7 +619,6 @@ function handleVRInput() {
   if (!session) return;
 
   const cam = renderer.xr.getCamera();
-  // Ensure camera matrix is updated for controller relative movement
   cam.updateMatrixWorld(true);
   
   camera.getWorldDirection(_vecDir);
