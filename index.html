@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>真・結界師VR — Final Adjust v7.6</title>
+<title>真・結界師VR — Final Adjust v7.7 (VR-Fix)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#87CEEB">
 <style>
@@ -102,7 +102,7 @@ import * as CANNON from 'cannon-es';
 // 1. CONFIG
 // --------------------------------------------------
 const CFG = {
-  VERSION: "v7.6",
+  VERSION: "v7.7 VR-Fix",
   colors: {
     sky: 0x87CEEB, ground: 0xC2B280, 
     kekkai: 0xffff00, ghost: 0x00ffff, 
@@ -117,7 +117,6 @@ const CFG = {
   player: { speed: 10.0, jump: 22.0, height: 1.7, maxHp: 100, maxSp: 100 },
   kekkai: { sensitivity: 300.0, spCostPerSec: 1.0, spRegen: 5.0, metsuCost: 1.0 },
   dist: { near: 6.0, far: 20.0 },
-  // 修正：基本アシスト半径1.5mだが、結界サイズに応じて拡大する
   aimAssist: { baseRadius: 1.5 }, 
   field: { width: 120, depth: 160 }
 };
@@ -450,19 +449,27 @@ function performMetsu(t) {
   spawnText("滅", t.mesh.position, "#f24"); 
   t.shrinking = true; 
   if (t.body) { world.removeBody(t.body); t.body = null; } 
-  
-  const kekkaiBox = new THREE.Box3().setFromObject(t.mesh); 
-  const loop = () => { 
-    if (!kekkaiList.includes(t)) return; 
+  // ★VRバグ修正: アニメーションループをここから削除し、updateShrinkingKekkaiに委譲
+}
+
+function updateShrinkingKekkai(dt) {
+  // ★VRバグ修正: メインループから毎フレーム呼ばれるアニメーション処理
+  [...kekkaiList].forEach(t => {
+    if (!t.shrinking) return;
+
     t.mesh.scale.multiplyScalar(0.7); 
+    
+    const kekkaiBox = new THREE.Box3().setFromObject(t.mesh); 
     enemies.forEach(e => { 
       const enemyBox = new THREE.Box3().setFromObject(e.mesh);
       if (kekkaiBox.intersectsBox(enemyBox)) { killEnemy(e); } 
     }); 
-    if (t.mesh.scale.x <= 0.05) { removeKekkai(t); spawnParticle(t.mesh.position, 30, 0xffaa00); } 
-    else { requestAnimationFrame(loop); }
-  }; 
-  loop(); 
+
+    if (t.mesh.scale.x <= 0.05) { 
+      removeKekkai(t); 
+      spawnParticle(t.mesh.position, 30, 0xffaa00); 
+    }
+  });
 }
 
 function actionMetsu() { 
@@ -487,8 +494,24 @@ function actionGlobalMetsu() {
     showMsg("霊力不足 (必要:" + Math.floor(cost) + ")", "#f00");
     return;
   }
-  showMsg("全方囲・滅", "#f24");
-  [...kekkaiList].forEach(k => performMetsu(k));
+
+  // ★演出追加: 画面全体フラッシュ（白→赤）
+  const overlay = document.getElementById('damage-overlay');
+  overlay.style.background = "white"; 
+  overlay.style.opacity = 0.8;
+  setTimeout(() => { 
+    overlay.style.opacity = 0; 
+    setTimeout(() => { overlay.style.background = "radial-gradient(circle, transparent 60%, red 100%)"; }, 200);
+  }, 100);
+
+  showMsg("全方囲・滅！！", "#f24");
+
+  [...kekkaiList].forEach(k => {
+    // ★演出追加: 結界を強制的に赤く・太くする
+    if(k.mesh.material) { k.mesh.material.color.setHex(0xff0000); k.mesh.material.opacity = 0.8; }
+    if(k.edges && k.edges.material) { k.edges.material.color.setHex(0xffff00); k.edges.material.linewidth = 5; }
+    performMetsu(k);
+  });
 }
 
 function actionGlobalKai() {
@@ -509,18 +532,12 @@ function updateAimMarker() {
   
   let bestCandidate = null;
   
-  // 修正: 結界のサイズを考慮した判定ロジック
-  // 中心からの距離だけでなく、結界のバウンディングボックスの大きさを加味して
-  // 「視線がその近くを通っているか」を判定する。
-  
-  // 1. Raycast (Precise Hit)
   raycaster.set(_vecPos, _vecDir);
   const intersects = raycaster.intersectObjects(kekkaiList.map(k => k.mesh));
   if (intersects.length > 0) {
       bestCandidate = kekkaiList.find(k => k.mesh === intersects[0].object);
   }
 
-  // 2. Fuzzy Assist (Size-dependent)
   if (!bestCandidate) {
       let minDistanceToRay = 999;
       kekkaiList.forEach(k => {
@@ -532,15 +549,10 @@ function updateAimMarker() {
           if (t > 0 && t < CFG.dist.far + 20) {
               const closestPoint = _vecPos.clone().add(_vecDir.clone().multiplyScalar(t));
               const dist = kPos.distanceTo(closestPoint);
-              
-              // 結界のサイズ（最大辺）を取得
               const size = Math.max(k.mesh.scale.x, k.mesh.scale.y, k.mesh.scale.z);
-              // アシスト許容範囲 = 基本1.5m + サイズの半分 (大きいほど吸い付きやすい)
               const allowDist = CFG.aimAssist.baseRadius + (size * 0.5);
               
               if (dist < allowDist) {
-                  // Rayからの距離が許容範囲内なら候補にする
-                  // 複数の場合は「Rayからの絶対距離が最も近いもの」を選ぶ
                   if (dist < minDistanceToRay) {
                       minDistanceToRay = dist;
                       bestCandidate = k;
@@ -832,6 +844,9 @@ function loop(t) {
   updateSP(dt);
   
   world.step(1 / 60, dt, 3);
+
+  // ★VRバグ修正: ここでアニメーションを実行
+  updateShrinkingKekkai(dt);
 
   if (!renderer.xr.isPresenting) { 
     const yaw = camAngle.yaw;
